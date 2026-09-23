@@ -5,19 +5,26 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# String de conexão fornecida pelo Supabase
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", 
-    "postgresql://postgres:[yMEl1uYhF2mcgMvy]@db.wroxsecuaftajtsbnctu.supabase.co:5432/postgres"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Render / Supabase requerem protocolo postgresql://
+if not DATABASE_URL:
+    raise ValueError("A variável de ambiente DATABASE_URL não foi encontrada!")
+
+# Ajusta protocolo se necessário
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+# Se não houver sslmode na URL, adiciona para garantir a conexão com o Supabase
+if "sslmode" not in DATABASE_URL:
+    DATABASE_URL += "?sslmode=require"
 
+# sslmode 'require' obriga a criptografia com o Supabase
+engine = create_engine(
+    DATABASE_URL, 
+    pool_pre_ping=True
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 def get_db():
