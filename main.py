@@ -1,5 +1,6 @@
 import io
 import uuid
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -8,12 +9,24 @@ from PIL import Image
 from database import engine, Base, get_db
 import models
 
-# Cria as tabelas automaticamente se ainda não existirem
-Base.metadata.create_all(bind=engine)
+# Evento de inicialização do FastAPI (substitui o evento antigo de startup)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        models.Base.metadata.create_all(bind=engine)
+        print(">>> Conexão com o banco estabelecida e tabelas verificadas no Supabase! <<<")
+    except Exception as e:
+        print(f">>> ERRO CRÍTICO NA CONEXÃO COM O BANCO: {e} <<<")
+        raise e
+    yield
 
-app = FastAPI(title="NFC Validation API", version="1.0.0")
+app = FastAPI(
+    title="NFC Validation API",
+    version="1.0.0",
+    lifespan=lifespan
+)
 
-# Habilita CORS para o front-end web consumir
+# CORS liberado para o front-end (sistema.aproximeaqui.com.br)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -33,6 +46,11 @@ def process_photo(file_bytes: bytes) -> bytes:
     output_buffer = io.BytesIO()
     img.save(output_buffer, format="WEBP", quality=80, optimize=True)
     return output_buffer.getvalue()
+
+# Healthcheck simples para verificar se a API está online
+@app.get("/")
+def health_check():
+    return {"status": "online", "message": "NFC Validation API rodando!"}
 
 # 1. Rota Pública: Validação do Cartão NFC
 @app.get("/v1/validate/{user_id}")
@@ -76,12 +94,10 @@ async def create_user(
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
-    # Processa e comprime a foto
     file_bytes = await file.read()
     compressed_photo = process_photo(file_bytes)
     
-    # Aqui você pode salvar o `compressed_photo` no Supabase Storage / R2
-    # e obter a URL pública para armazenar no campo `photo_url`.
+    # URL temporária até configurarmos o R2/Supabase Storage
     mock_photo_url = f"https://seu-storage.com/photos/{uuid.uuid4()}.webp"
 
     new_user = models.User(
