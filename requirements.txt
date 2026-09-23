@@ -4,3 +4,4 @@ sqlalchemy>=2.0.28
 psycopg2-binary>=2.9.9
 pillow>=10.3.0
 python-dotenv>=1.0.1
+python-multipart>=0.0.9
