@@ -113,3 +113,30 @@ async def create_user(
     db.refresh(new_user)
     
     return new_user
+
+
+# 3. Rota Admin: Listar todos os usuários
+@app.get("/v1/admin/users")
+def list_users(db: Session = Depends(get_db)):
+    users = db.query(models.User).order_by(models.User.created_at.desc()).all() if hasattr(models.User, 'created_at') else db.query(models.User).all()
+    return users
+
+# 4. Rota Admin: Inativar / Reativar Usuário
+@app.patch("/v1/admin/users/{user_id}/status")
+def toggle_user_status(user_id: uuid.UUID, new_status: str = None, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.id == user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Usuário não encontrado."
+        )
+    
+    # Se passar new_status usa ele, senão faz toggle simples (active <-> inactive)
+    if new_status:
+        user.status = new_status
+    else:
+        user.status = "inactive" if user.status == "active" else "active"
+        
+    db.commit()
+    db.refresh(user)
+    return {"message": "Status atualizado com sucesso", "id": str(user.id), "status": user.status}
