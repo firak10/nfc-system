@@ -1,13 +1,16 @@
 import os
+import io
+import base64
 import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, status
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 import jwt
+from PIL import Image
 
 # ==========================================
 # CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
@@ -36,6 +39,20 @@ def get_db():
         yield conn
     finally:
         conn.close()
+
+# Helper para redimensionamento e compressão de foto em WebP (~20KB a 30KB) em Data URI Base64
+def process_photo_to_base64(file_bytes: bytes) -> str:
+    img = Image.open(io.BytesIO(file_bytes))
+    
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+        
+    img.thumbnail((400, 500), Image.Resampling.LANCZOS)
+    output_buffer = io.BytesIO()
+    img.save(output_buffer, format="WEBP", quality=80, optimize=True)
+    
+    encoded = base64.b64encode(output_buffer.getvalue()).decode("utf-8")
+    return f"data:image/webp;base64,{encoded}"
 
 # ==========================================
 # HELPER FUNCTIONS (AUTH & JWT)
@@ -100,7 +117,50 @@ class CreateCompanySchema(BaseModel):
     admin_name: str
 
 # ==========================================
-# ROTAS DE AUTENTICAÇÃO
+# ROTAS PÚBLICAS (VALIDAÇÃO DE CRACHÁ NFC)
+# ==========================================
+
+@app.get("/v1/validate/{user_id}")
+def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
+    with conn.cursor() as cur:
+        # Busca os dados do usuário portador do crachá
+        cur.execute("""
+            SELECT u.id, u.full_name, u.document, u.photo_url, u.status, u.expires_at, c.name as company_name
+            FROM users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            WHERE u.id = %s
+        """, (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="Usuário / Cartão não encontrado."
+            )
+
+        # Registra o log de auditoria da leitura NFC
+        client_ip = request.client.host if request.client else None
+        user_agent = request.headers.get("user-agent")
+
+        cur.execute("""
+            INSERT INTO access_logs (user_id, ip_address, user_agent)
+            VALUES (%s, %s, %s)
+        """, (user["id"], client_ip, user_agent))
+        conn.commit()
+
+        return {
+            "id": str(user["id"]),
+            "full_name": user["full_name"],
+            "document": user["document"],
+            "photo_url": user["photo_url"],
+            "company_name": user["company_name"],
+            "status": user["status"],
+            "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
+            "is_valid": user["status"] == "active"
+        }
+
+# ==========================================
+# ROTAS DE AUTENTICAÇÃO DE PAINEL
 # ==========================================
 
 @app.post("/v1/auth/login")
@@ -185,7 +245,6 @@ def nfc_login(data: NFCLoginSchema, conn=Depends(get_db)):
 def create_company(data: CreateCompanySchema, current_user=Depends(require_superadmin), conn=Depends(get_db)):
     try:
         with conn.cursor() as cur:
-            # 1. Cria a empresa
             cur.execute("""
                 INSERT INTO companies (name, document) 
                 VALUES (%s, %s) 
@@ -194,7 +253,6 @@ def create_company(data: CreateCompanySchema, current_user=Depends(require_super
             company = cur.fetchone()
             company_id = company["id"]
 
-            # 2. Cria o administrador da empresa
             hashed_pwd = get_password_hash(data.admin_password)
             cur.execute("""
                 INSERT INTO admin_users (company_id, email, password_hash, full_name, role)
@@ -231,7 +289,7 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
     with conn.cursor() as cur:
         cur.execute("""
             SELECT c.id, c.name, c.document, c.active, c.created_at,
-                   u.email as admin_email, u.full_name as admin_name, u.login_token
+                   u.id as admin_id, u.email as admin_email, u.full_name as admin_name, u.login_token
             FROM companies c
             LEFT JOIN admin_users u ON u.company_id = c.id AND u.role = 'admin'
             ORDER BY c.created_at DESC
@@ -247,6 +305,7 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
                 "active": item["active"],
                 "created_at": item["created_at"].isoformat() if item["created_at"] else None,
                 "admin": {
+                    "id": str(item["admin_id"]) if item["admin_id"] else None,
                     "name": item["admin_name"],
                     "email": item["admin_email"],
                     "login_nfc_url": f"https://login.aproximeaqui.com.br/?token={item['login_token']}" if item["login_token"] else None
@@ -255,7 +314,7 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
         return result
 
 # ==========================================
-# ROTAS DO PAINEL ADMIN (GESTÃO DE CARTÕES)
+# ROTAS DO PAINEL ADMIN (GESTÃO DE USUÁRIOS / CRACHÁS)
 # ==========================================
 
 @app.get("/v1/admin/users")
@@ -264,17 +323,16 @@ def list_users(current_user=Depends(get_current_user), conn=Depends(get_db)):
     role = current_user.get("role")
 
     with conn.cursor() as cur:
-        # Se for Superadmin, lista tudo. Se for Admin, lista apenas da sua empresa.
         if role == "superadmin":
             cur.execute("""
-                SELECT u.id, u.company_id, u.full_name, u.document, u.status, u.created_at, c.name as company_name
+                SELECT u.id, u.company_id, u.full_name, u.document, u.photo_url, u.status, u.created_at, c.name as company_name
                 FROM users u
                 LEFT JOIN companies c ON c.id = u.company_id
                 ORDER BY u.created_at DESC
             """)
         else:
             cur.execute("""
-                SELECT id, company_id, full_name, document, status, created_at
+                SELECT id, company_id, full_name, document, photo_url, status, created_at
                 FROM users
                 WHERE company_id = %s
                 ORDER BY created_at DESC
@@ -285,4 +343,91 @@ def list_users(current_user=Depends(get_current_user), conn=Depends(get_db)):
             u["id"] = str(u["id"])
             if "company_id" in u and u["company_id"]:
                 u["company_id"] = str(u["company_id"])
+            if u.get("created_at"):
+                u["created_at"] = u["created_at"].isoformat()
         return users
+
+@app.post("/v1/admin/users", status_code=status.HTTP_201_CREATED)
+async def create_user(
+    full_name: str = Form(...),
+    document: Optional[str] = Form(None),
+    company_id: Optional[str] = Form(None),
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    conn=Depends(get_db)
+):
+    # Se não passar company_id, atribui a empresa do admin logado
+    target_company_id = company_id if (current_user.get("role") == "superadmin" and company_id) else current_user.get("company_id")
+
+    if not target_company_id:
+        raise HTTPException(status_code=400, detail="É necessário informar a empresa do usuário.")
+
+    # Processa e comprime a foto para WebP (~20KB em Data URI)
+    file_bytes = await file.read()
+    compressed_photo_base64 = process_photo_to_base64(file_bytes)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO users (company_id, full_name, document, photo_url, status)
+            VALUES (%s, %s, %s, %s, 'active')
+            RETURNING id, company_id, full_name, document, photo_url, status, created_at
+        """, (target_company_id, full_name, document, compressed_photo_base64))
+        
+        new_user = cur.fetchone()
+        conn.commit()
+
+        new_user["id"] = str(new_user["id"])
+        new_user["company_id"] = str(new_user["company_id"])
+        new_user["created_at"] = new_user["created_at"].isoformat()
+        return new_user
+
+# ==========================================
+# REVOGAÇÃO / REGENERAÇÃO DE TOKEN NFC DE LOGIN
+# ==========================================
+
+@app.post("/v1/admin/revoke-nfc-token")
+def revoke_my_nfc_token(current_user=Depends(get_current_user), conn=Depends(get_db)):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE admin_users 
+            SET login_token = gen_random_uuid() 
+            WHERE id = %s 
+            RETURNING login_token
+        """, (current_user["sub"],))
+        
+        result = cur.fetchone()
+        conn.commit()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+        new_token = str(result["login_token"])
+        return {
+            "message": "Cartão antigo revogado com sucesso! O token anterior foi invalidado.",
+            "new_token": new_token,
+            "new_login_nfc_url": f"https://login.aproximeaqui.com.br/?token={new_token}"
+        }
+
+@app.post("/v1/superadmin/admins/{admin_id}/revoke-nfc-token")
+def revoke_company_admin_nfc_token(admin_id: str, current_user=Depends(require_superadmin), conn=Depends(get_db)):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE admin_users 
+            SET login_token = gen_random_uuid() 
+            WHERE id = %s 
+            RETURNING id, full_name, email, login_token
+        """, (admin_id,))
+        
+        result = cur.fetchone()
+        conn.commit()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Administrador não encontrado.")
+
+        new_token = str(result["login_token"])
+        return {
+            "message": f"Cartão de {result['full_name']} revogado com sucesso!",
+            "admin_id": str(result["id"]),
+            "new_token": new_token,
+            "new_login_nfc_url": f"https://login.aproximeaqui.com.br/?token={new_token}"
+        }
