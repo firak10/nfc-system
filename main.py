@@ -5,16 +5,12 @@ import datetime
 from typing import Optional
 from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 import jwt
 from PIL import Image
-
-from pydantic import BaseModel, Field
-
-
 
 # ==========================================
 # CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
@@ -123,9 +119,16 @@ class CreateCompanySchema(BaseModel):
 class UpdateUserStatusSchema(BaseModel):
     status: str
 
+class UpdateCompanyStatusSchema(BaseModel):
+    active: bool
+
+class SuperadminChangeCompanyPasswordSchema(BaseModel):
+    password: str = Field(..., min_length=6)
+
 class ChangePasswordSchema(BaseModel):
     current_password: str = Field(..., min_length=1)
     new_password: str = Field(..., min_length=6)
+
 # ==========================================
 # ROTAS PÚBLICAS (VALIDAÇÃO DE CRACHÁ NFC)
 # ==========================================
@@ -133,7 +136,6 @@ class ChangePasswordSchema(BaseModel):
 @app.get("/v1/validate/{user_id}")
 def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
     with conn.cursor() as cur:
-        # Busca os dados do usuário portador do crachá
         cur.execute("""
             SELECT u.id, u.full_name, u.document, u.photo_url, u.status, u.expires_at, c.name as company_name
             FROM users u
@@ -148,7 +150,6 @@ def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
                 detail="Usuário / Cartão não encontrado."
             )
 
-        # Registra o log de auditoria da leitura NFC
         client_ip = request.client.host if request.client else None
         user_agent = request.headers.get("user-agent")
 
@@ -284,6 +285,7 @@ def create_company(data: CreateCompanySchema, current_user=Depends(require_super
                     "id": str(admin_user["id"]),
                     "full_name": admin_user["full_name"],
                     "email": admin_user["email"],
+                    "login_token": str(admin_user["login_token"]),
                     "login_nfc_url": f"https://login.aproximeaqui.com.br/?token={admin_user['login_token']}"
                 }
             }
@@ -308,20 +310,112 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
 
         result = []
         for item in companies:
+            login_token_str = str(item["login_token"]) if item.get("login_token") else None
             result.append({
                 "id": str(item["id"]),
                 "name": item["name"],
                 "document": item["document"],
                 "active": item["active"],
+                "access_token": login_token_str,
                 "created_at": item["created_at"].isoformat() if item["created_at"] else None,
                 "admin": {
                     "id": str(item["admin_id"]) if item["admin_id"] else None,
                     "name": item["admin_name"],
                     "email": item["admin_email"],
-                    "login_nfc_url": f"https://login.aproximeaqui.com.br/?token={item['login_token']}" if item["login_token"] else None
+                    "login_token": login_token_str,
+                    "login_nfc_url": f"https://login.aproximeaqui.com.br/?token={login_token_str}" if login_token_str else None
                 }
             })
         return result
+
+@app.patch("/v1/superadmin/companies/{company_id}/status")
+def update_company_status(
+    company_id: str, 
+    data: UpdateCompanyStatusSchema, 
+    current_user=Depends(require_superadmin), 
+    conn=Depends(get_db)
+):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE companies 
+            SET active = %s 
+            WHERE id = %s 
+            RETURNING id, name, active
+        """, (data.active, company_id))
+        
+        updated_company = cur.fetchone()
+        
+        # Opcional: Atualiza o status de todos os administradores vinculados à empresa
+        cur.execute("""
+            UPDATE admin_users 
+            SET active = %s 
+            WHERE company_id = %s
+        """, (data.active, company_id))
+
+        conn.commit()
+
+        if not updated_company:
+            raise HTTPException(status_code=404, detail="Empresa não encontrada.")
+
+        return {
+            "message": f"Status da empresa '{updated_company['name']}' alterado com sucesso.",
+            "id": str(updated_company["id"]),
+            "active": updated_company["active"]
+        }
+
+@app.post("/v1/superadmin/companies/{company_id}/rotate-token")
+def rotate_company_token(
+    company_id: str, 
+    current_user=Depends(require_superadmin), 
+    conn=Depends(get_db)
+):
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE admin_users 
+            SET login_token = gen_random_uuid() 
+            WHERE company_id = %s AND role = 'admin'
+            RETURNING id, full_name, email, login_token
+        """, (company_id,))
+        
+        updated_admin = cur.fetchone()
+        conn.commit()
+
+        if not updated_admin:
+            raise HTTPException(status_code=404, detail="Administrador da empresa não encontrado.")
+
+        new_token = str(updated_admin["login_token"])
+        return {
+            "message": "Token de acesso NFC rotacionado com sucesso!",
+            "access_token": new_token,
+            "new_login_nfc_url": f"https://login.aproximeaqui.com.br/?token={new_token}"
+        }
+
+@app.patch("/v1/superadmin/companies/{company_id}/password")
+def change_company_admin_password(
+    company_id: str,
+    data: SuperadminChangeCompanyPasswordSchema,
+    current_user=Depends(require_superadmin),
+    conn=Depends(get_db)
+):
+    new_hashed_pwd = get_password_hash(data.password)
+
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE admin_users 
+            SET password_hash = %s 
+            WHERE company_id = %s AND role = 'admin'
+            RETURNING id, email, full_name
+        """, (new_hashed_pwd, company_id))
+
+        updated_admin = cur.fetchone()
+        conn.commit()
+
+        if not updated_admin:
+            raise HTTPException(status_code=404, detail="Administrador da empresa não encontrado.")
+
+        return {
+            "message": f"Senha do administrador '{updated_admin['full_name']}' atualizada com sucesso!"
+        }
 
 # ==========================================
 # ROTAS DO PAINEL ADMIN (GESTÃO DE USUÁRIOS / CRACHÁS)
@@ -366,13 +460,11 @@ async def create_user(
     current_user=Depends(get_current_user),
     conn=Depends(get_db)
 ):
-    # Se não passar company_id, atribui a empresa do admin logado
     target_company_id = company_id if (current_user.get("role") == "superadmin" and company_id) else current_user.get("company_id")
 
     if not target_company_id:
         raise HTTPException(status_code=400, detail="É necessário informar a empresa do usuário.")
 
-    # Processa e comprime a foto para WebP (~20KB em Data URI)
     file_bytes = await file.read()
     compressed_photo_base64 = process_photo_to_base64(file_bytes)
 
@@ -443,7 +535,7 @@ def revoke_company_admin_nfc_token(admin_id: str, current_user=Depends(require_s
         }
 
 # ==========================================
-# ROTAS ALTERAÇÃO STATUS
+# ROTAS ALTERAÇÃO STATUS DE USUÁRIO
 # ==========================================
 @app.patch("/v1/admin/users/{user_id}/status")
 def update_user_status(
@@ -459,7 +551,6 @@ def update_user_status(
         raise HTTPException(status_code=400, detail="Status inválido. Use 'active' ou 'inactive'.")
 
     with conn.cursor() as cur:
-        # Se for superadmin pode alterar qualquer utilizador; se for admin comum só altera da própria empresa
         if role == "superadmin":
             cur.execute("""
                 UPDATE users 
@@ -490,7 +581,6 @@ def update_user_status(
             "status": updated_user["status"]
         }
 
-
 # ==========================================
 # ROTAS CHANGE PASSWORD
 # ==========================================
@@ -504,7 +594,6 @@ def change_admin_password(
     user_id = current_user.get("sub")
 
     with conn.cursor() as cur:
-        # 1. Procura a palavra-passe atual encriptada no banco de dados
         cur.execute("""
             SELECT id, password_hash 
             FROM admin_users 
@@ -518,14 +607,12 @@ def change_admin_password(
                 detail="Utilizador não encontrado."
             )
 
-        # 2. Valida se a palavra-passe atual coincide
         if not verify_password(data.current_password, user["password_hash"]):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="A senha atual está incorreta."
             )
 
-        # 3. Gera o novo hash e atualiza na tabela admin_users
         new_hashed_password = get_password_hash(data.new_password)
 
         cur.execute("""
