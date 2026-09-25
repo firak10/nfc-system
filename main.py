@@ -498,22 +498,42 @@ def update_user_status(
 @app.patch("/v1/admin/change-password", status_code=status.HTTP_200_OK)
 def change_admin_password(
     data: ChangePasswordSchema,
-    current_user: dict = Depends(get_current_user), # Injeção do usuário logado via JWT
-    db = Depends(get_db) # Sua sessão com o banco de dados
+    current_user: dict = Depends(get_current_user),
+    conn = Depends(get_db)
 ):
-    # 1. Verifica se a senha atual informada bate com a senha no banco
-    if not verify_password(data.current_password, current_user.hashed_password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="A senha atual está incorreta."
-        )
+    user_id = current_user.get("sub")
 
-    # 2. Gera o hash da nova senha
-    new_hashed_password = get_password_hash(data.new_password)
+    with conn.cursor() as cur:
+        # 1. Procura a palavra-passe atual encriptada no banco de dados
+        cur.execute("""
+            SELECT id, password_hash 
+            FROM admin_users 
+            WHERE id = %s
+        """, (user_id,))
+        user = cur.fetchone()
 
-    # 3. Atualiza no banco de dados
-    current_user.hashed_password = new_hashed_password
-    db.add(current_user)
-    db.commit()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Utilizador não encontrado."
+            )
+
+        # 2. Valida se a palavra-passe atual coincide
+        if not verify_password(data.current_password, user["password_hash"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="A senha atual está incorreta."
+            )
+
+        # 3. Gera o novo hash e atualiza na tabela admin_users
+        new_hashed_password = get_password_hash(data.new_password)
+
+        cur.execute("""
+            UPDATE admin_users 
+            SET password_hash = %s 
+            WHERE id = %s
+        """, (new_hashed_password, user_id))
+        
+        conn.commit()
 
     return {"message": "Senha alterada com sucesso!"}
