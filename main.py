@@ -116,6 +116,8 @@ class CreateCompanySchema(BaseModel):
     admin_password: str
     admin_name: str
 
+class UpdateUserStatusSchema(BaseModel):
+    status: str
 # ==========================================
 # ROTAS PÚBLICAS (VALIDAÇÃO DE CRACHÁ NFC)
 # ==========================================
@@ -431,3 +433,52 @@ def revoke_company_admin_nfc_token(admin_id: str, current_user=Depends(require_s
             "new_token": new_token,
             "new_login_nfc_url": f"https://login.aproximeaqui.com.br/?token={new_token}"
         }
+
+# ==========================================
+# ROTAS ALTERAÇÃO STATUS
+# ==========================================
+@app.patch("/v1/admin/users/{user_id}/status")
+def update_user_status(
+    user_id: str, 
+    data: UpdateUserStatusSchema, 
+    current_user=Depends(get_current_user), 
+    conn=Depends(get_db)
+):
+    company_id = current_user.get("company_id")
+    role = current_user.get("role")
+
+    if data.status not in ["active", "inactive"]:
+        raise HTTPException(status_code=400, detail="Status inválido. Use 'active' ou 'inactive'.")
+
+    with conn.cursor() as cur:
+        # Se for superadmin pode alterar qualquer utilizador; se for admin comum só altera da própria empresa
+        if role == "superadmin":
+            cur.execute("""
+                UPDATE users 
+                SET status = %s 
+                WHERE id = %s 
+                RETURNING id, full_name, status
+            """, (data.status, user_id))
+        else:
+            cur.execute("""
+                UPDATE users 
+                SET status = %s 
+                WHERE id = %s AND company_id = %s 
+                RETURNING id, full_name, status
+            """, (data.status, user_id, company_id))
+
+        updated_user = cur.fetchone()
+        conn.commit()
+
+        if not updated_user:
+            raise HTTPException(
+                status_code=404, 
+                detail="Utilizador não encontrado ou sem permissão para alterá-lo."
+            )
+
+        return {
+            "message": f"Status do utilizador {updated_user['full_name']} alterado para {updated_user['status']}.",
+            "id": str(updated_user["id"]),
+            "status": updated_user["status"]
+        }
+
