@@ -3,7 +3,7 @@ import io
 import base64
 import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 import psycopg2
@@ -11,6 +11,10 @@ from psycopg2.extras import RealDictCursor
 from passlib.context import CryptContext
 import jwt
 from PIL import Image
+
+from pydantic import BaseModel, Field
+
+
 
 # ==========================================
 # CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
@@ -118,6 +122,10 @@ class CreateCompanySchema(BaseModel):
 
 class UpdateUserStatusSchema(BaseModel):
     status: str
+
+class ChangePasswordSchema(BaseModel):
+    current_password: str = Field(..., min_length=1)
+    new_password: str = Field(..., min_length=6)
 # ==========================================
 # ROTAS PÚBLICAS (VALIDAÇÃO DE CRACHÁ NFC)
 # ==========================================
@@ -482,3 +490,30 @@ def update_user_status(
             "status": updated_user["status"]
         }
 
+
+# ==========================================
+# ROTAS CHANGE PASSWORD
+# ==========================================
+
+@app.patch("/v1/admin/change-password", status_code=status.HTTP_200_OK)
+def change_admin_password(
+    data: ChangePasswordSchema,
+    current_user: dict = Depends(get_current_user), # Injeção do usuário logado via JWT
+    db = Depends(get_db) # Sua sessão com o banco de dados
+):
+    # 1. Verifica se a senha atual informada bate com a senha no banco
+    if not verify_password(data.current_password, current_user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A senha atual está incorreta."
+        )
+
+    # 2. Gera o hash da nova senha
+    new_hashed_password = get_password_hash(data.new_password)
+
+    # 3. Atualiza no banco de dados
+    current_user.hashed_password = new_hashed_password
+    db.add(current_user)
+    db.commit()
+
+    return {"message": "Senha alterada com sucesso!"}
