@@ -19,6 +19,7 @@ class User(Base):
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.id", ondelete="SET NULL"), nullable=True)
     full_name = Column(String(255), nullable=False)
     document = Column(String(50), nullable=True)
+    card_identifier = Column(String(100), nullable=True)  # <--- NOVA COLUNA ADICIONADA
     photo_url = Column(String, nullable=True)
     status = Column(String(20), default="active")  # 'active', 'inactive', 'suspended'
     expires_at = Column(Date, nullable=True)

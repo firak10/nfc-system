@@ -22,7 +22,7 @@ ACCESS_TOKEN_EXPIRE_DAYS = 7
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app = FastAPI(title="Aproxime Aqui - API", version="2.0.0")
+app = FastAPI(title="Aproxime Aqui - API", version="2.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -137,7 +137,7 @@ class ChangePasswordSchema(BaseModel):
 def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT u.id, u.full_name, u.document, u.photo_url, u.status, u.expires_at, c.name as company_name
+            SELECT u.id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.expires_at, c.name as company_name
             FROM users u
             LEFT JOIN companies c ON c.id = u.company_id
             WHERE u.id = %s
@@ -163,6 +163,56 @@ def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
             "id": str(user["id"]),
             "full_name": user["full_name"],
             "document": user["document"],
+            "card_identifier": user["card_identifier"],
+            "photo_url": user["photo_url"],
+            "company_name": user["company_name"],
+            "status": user["status"],
+            "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
+            "is_valid": user["status"] == "active"
+        }
+
+# ==========================================
+# ROTA DE CHECAGEM PRESENCIAL POR LEITOR/CÓDIGO (PROTEGIDA)
+# ==========================================
+
+@app.get("/v1/check/card/{identifier}")
+def check_card_by_identifier(
+    identifier: str, 
+    current_user=Depends(get_current_user), 
+    conn=Depends(get_db)
+):
+    company_id = current_user.get("company_id")
+    role = current_user.get("role")
+
+    with conn.cursor() as cur:
+        if role == "superadmin":
+            cur.execute("""
+                SELECT u.id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.expires_at, c.name as company_name
+                FROM users u
+                LEFT JOIN companies c ON c.id = u.company_id
+                WHERE u.card_identifier = %s
+            """, (identifier,))
+        else:
+            cur.execute("""
+                SELECT u.id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.expires_at, c.name as company_name
+                FROM users u
+                LEFT JOIN companies c ON c.id = u.company_id
+                WHERE u.card_identifier = %s AND u.company_id = %s
+            """, (identifier, company_id))
+
+        user = cur.fetchone()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, 
+                detail="Cartão/Código não encontrado para esta empresa."
+            )
+
+        return {
+            "id": str(user["id"]),
+            "full_name": user["full_name"],
+            "document": user["document"],
+            "card_identifier": user["card_identifier"],
             "photo_url": user["photo_url"],
             "company_name": user["company_name"],
             "status": user["status"],
@@ -345,7 +395,6 @@ def update_company_status(
         
         updated_company = cur.fetchone()
         
-        # Opcional: Atualiza o status de todos os administradores vinculados à empresa
         cur.execute("""
             UPDATE admin_users 
             SET active = %s 
@@ -429,14 +478,14 @@ def list_users(current_user=Depends(get_current_user), conn=Depends(get_db)):
     with conn.cursor() as cur:
         if role == "superadmin":
             cur.execute("""
-                SELECT u.id, u.company_id, u.full_name, u.document, u.photo_url, u.status, u.created_at, c.name as company_name
+                SELECT u.id, u.company_id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.created_at, c.name as company_name
                 FROM users u
                 LEFT JOIN companies c ON c.id = u.company_id
                 ORDER BY u.created_at DESC
             """)
         else:
             cur.execute("""
-                SELECT id, company_id, full_name, document, photo_url, status, created_at
+                SELECT id, company_id, full_name, document, card_identifier, photo_url, status, created_at
                 FROM users
                 WHERE company_id = %s
                 ORDER BY created_at DESC
@@ -455,6 +504,7 @@ def list_users(current_user=Depends(get_current_user), conn=Depends(get_db)):
 async def create_user(
     full_name: str = Form(...),
     document: Optional[str] = Form(None),
+    card_identifier: Optional[str] = Form(None),  # <--- NOVO CAMPO RECEBIDO
     company_id: Optional[str] = Form(None),
     file: UploadFile = File(...),
     current_user=Depends(get_current_user),
@@ -465,15 +515,31 @@ async def create_user(
     if not target_company_id:
         raise HTTPException(status_code=400, detail="É necessário informar a empresa do usuário.")
 
+    card_id_clean = card_identifier.strip() if card_identifier and card_identifier.strip() else None
+
+    # Valida duplicidade dentro da mesma empresa antes do insert
+    if card_id_clean:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT id FROM users 
+                WHERE company_id = %s AND card_identifier = %s
+            """, (target_company_id, card_id_clean))
+            existing = cur.fetchone()
+            if existing:
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Este código/UID de cartão já está cadastrado para outro colaborador nesta empresa."
+                )
+
     file_bytes = await file.read()
     compressed_photo_base64 = process_photo_to_base64(file_bytes)
 
     with conn.cursor() as cur:
         cur.execute("""
-            INSERT INTO users (company_id, full_name, document, photo_url, status)
-            VALUES (%s, %s, %s, %s, 'active')
-            RETURNING id, company_id, full_name, document, photo_url, status, created_at
-        """, (target_company_id, full_name, document, compressed_photo_base64))
+            INSERT INTO users (company_id, full_name, document, card_identifier, photo_url, status)
+            VALUES (%s, %s, %s, %s, %s, 'active')
+            RETURNING id, company_id, full_name, document, card_identifier, photo_url, status, created_at
+        """, (target_company_id, full_name, document, card_id_clean, compressed_photo_base64))
         
         new_user = cur.fetchone()
         conn.commit()
