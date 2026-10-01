@@ -3,7 +3,7 @@ import io
 import base64
 import datetime
 from typing import Optional
-from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status, APIRouter
+from fastapi import FastAPI, HTTPException, Depends, Header, Request, UploadFile, File, Form, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 import psycopg2
@@ -20,6 +20,9 @@ JWT_SECRET = os.getenv("JWT_SECRET", "troque_essa_chave_secreta_em_producao_1234
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 7
 
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 app = FastAPI(title="Aproxime Aqui - API", version="2.1.0")
@@ -32,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Conexão com o Banco de Dados
+# Conexão com o Banco de Dados (RAW Cursor com RealDictCursor)
 def get_db():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
     try:
@@ -40,7 +43,7 @@ def get_db():
     finally:
         conn.close()
 
-# Helper para redimensionamento e compressão de foto em WebP (~20KB a 30KB) em Data URI Base64
+# Helper para redimensionamento e compressão de foto em WebP (~20KB a 30KB)
 def process_photo_to_base64(file_bytes: bytes) -> str:
     img = Image.open(io.BytesIO(file_bytes))
     
@@ -504,7 +507,7 @@ def list_users(current_user=Depends(get_current_user), conn=Depends(get_db)):
 async def create_user(
     full_name: str = Form(...),
     document: Optional[str] = Form(None),
-    card_identifier: Optional[str] = Form(None),  # <--- NOVO CAMPO RECEBIDO
+    card_identifier: Optional[str] = Form(None),
     company_id: Optional[str] = Form(None),
     file: UploadFile = File(...),
     current_user=Depends(get_current_user),
