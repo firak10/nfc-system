@@ -770,15 +770,35 @@ def change_admin_password(
 
     return {"message": "Senha alterada com sucesso!"}
 
-#---------------- rota para as cores
-@router.get("/v1/admin/me")
-def get_admin_profile(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
-    company = db.query(Company).filter(Company.id == current_user.company_id).first()
-    return {
-        "id": current_user.id,
-        "full_name": current_user.full_name,
-        "email": current_user.email,
-        "company_name": company.name if company else "",
-        "primary_color": company.primary_color if company else "#2563eb",
-        "logo_url": company.logo_url if company else None
-    }
+# ==========================================
+# ROTAS DO PAINEL ADMIN (GESTÃO DE USUÁRIOS / CRACHÁS / PERFIL)
+# ==========================================
+
+@app.get("/v1/admin/me")
+def get_admin_me(current_user=Depends(get_current_user), conn=Depends(get_db)):
+    user_id = current_user.get("sub")
+    
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT u.id, u.full_name, u.email, u.role, u.company_id,
+                   c.name as company_name, c.primary_color, c.secondary_color, c.logo_url
+            FROM admin_users u
+            LEFT JOIN companies c ON c.id = u.company_id
+            WHERE u.id = %s
+        """, (user_id,))
+        user = cur.fetchone()
+
+        if not user:
+            raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+
+        return {
+            "id": str(user["id"]),
+            "full_name": user["full_name"],
+            "email": user["email"],
+            "role": user["role"],
+            "company_id": str(user["company_id"]) if user["company_id"] else None,
+            "company_name": user["company_name"],
+            "primary_color": user.get("primary_color"),
+            "secondary_color": user.get("secondary_color"),
+            "logo_url": user.get("logo_url")
+        }
