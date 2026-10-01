@@ -25,7 +25,7 @@ if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-app = FastAPI(title="Aproxime Aqui - API", version="2.1.0")
+app = FastAPI(title="Aproxime Aqui - API", version="2.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -115,9 +115,17 @@ class NFCLoginSchema(BaseModel):
 class CreateCompanySchema(BaseModel):
     name: str
     document: Optional[str] = None
+    primary_color: Optional[str] = "#002b66"
+    secondary_color: Optional[str] = "#f4f6f9"
+    logo_url: Optional[str] = None
     admin_email: EmailStr
     admin_password: str
     admin_name: str
+
+class UpdateCompanyBrandingSchema(BaseModel):
+    primary_color: Optional[str] = None
+    secondary_color: Optional[str] = None
+    logo_url: Optional[str] = None
 
 class UpdateUserStatusSchema(BaseModel):
     status: str
@@ -140,7 +148,8 @@ class ChangePasswordSchema(BaseModel):
 def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT u.id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.expires_at, c.name as company_name
+            SELECT u.id, u.full_name, u.document, u.card_identifier, u.photo_url, u.status, u.expires_at,
+                   c.name as company_name, c.primary_color, c.secondary_color, c.logo_url
             FROM users u
             LEFT JOIN companies c ON c.id = u.company_id
             WHERE u.id = %s
@@ -169,6 +178,9 @@ def validate_card(user_id: str, request: Request, conn=Depends(get_db)):
             "card_identifier": user["card_identifier"],
             "photo_url": user["photo_url"],
             "company_name": user["company_name"],
+            "primary_color": user.get("primary_color"),
+            "secondary_color": user.get("secondary_color"),
+            "logo_url": user.get("logo_url"),
             "status": user["status"],
             "expires_at": user["expires_at"].isoformat() if user["expires_at"] else None,
             "is_valid": user["status"] == "active"
@@ -310,10 +322,10 @@ def create_company(data: CreateCompanySchema, current_user=Depends(require_super
     try:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO companies (name, document) 
-                VALUES (%s, %s) 
-                RETURNING id, name, document, active, created_at
-            """, (data.name, data.document))
+                INSERT INTO companies (name, document, primary_color, secondary_color, logo_url) 
+                VALUES (%s, %s, %s, %s, %s) 
+                RETURNING id, name, document, primary_color, secondary_color, logo_url, active, created_at
+            """, (data.name, data.document, data.primary_color, data.secondary_color, data.logo_url))
             company = cur.fetchone()
             company_id = company["id"]
 
@@ -332,6 +344,9 @@ def create_company(data: CreateCompanySchema, current_user=Depends(require_super
                     "id": str(company["id"]),
                     "name": company["name"],
                     "document": company["document"],
+                    "primary_color": company["primary_color"],
+                    "secondary_color": company["secondary_color"],
+                    "logo_url": company["logo_url"],
                     "active": company["active"]
                 },
                 "admin_user": {
@@ -353,7 +368,7 @@ def create_company(data: CreateCompanySchema, current_user=Depends(require_super
 def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db)):
     with conn.cursor() as cur:
         cur.execute("""
-            SELECT c.id, c.name, c.document, c.active, c.created_at,
+            SELECT c.id, c.name, c.document, c.primary_color, c.secondary_color, c.logo_url, c.active, c.created_at,
                    u.id as admin_id, u.email as admin_email, u.full_name as admin_name, u.login_token
             FROM companies c
             LEFT JOIN admin_users u ON u.company_id = c.id AND u.role = 'admin'
@@ -368,6 +383,9 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
                 "id": str(item["id"]),
                 "name": item["name"],
                 "document": item["document"],
+                "primary_color": item.get("primary_color"),
+                "secondary_color": item.get("secondary_color"),
+                "logo_url": item.get("logo_url"),
                 "active": item["active"],
                 "access_token": login_token_str,
                 "created_at": item["created_at"].isoformat() if item["created_at"] else None,
@@ -380,6 +398,64 @@ def list_companies(current_user=Depends(require_superadmin), conn=Depends(get_db
                 }
             })
         return result
+
+# --- ENDPOINT DE ATUALIZAÇÃO DE BRANDING/MARCA ---
+@app.patch("/v1/superadmin/companies/{company_id}/branding")
+def update_company_branding(
+    company_id: str,
+    data: UpdateCompanyBrandingSchema,
+    current_user=Depends(require_superadmin),
+    conn=Depends(get_db)
+):
+    updates = []
+    params = []
+
+    if data.primary_color is not None:
+        updates.append("primary_color = %s")
+        params.append(data.primary_color)
+
+    if data.secondary_color is not None:
+        updates.append("secondary_color = %s")
+        params.append(data.secondary_color)
+
+    if data.logo_url is not None:
+        updates.append("logo_url = %s")
+        params.append(data.logo_url)
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nenhum campo informado para atualização.")
+
+    params.append(company_id)
+    query = f"UPDATE companies SET {', '.join(updates)} WHERE id = %s RETURNING id, name, primary_color, secondary_color, logo_url"
+
+    with conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        updated = cur.fetchone()
+        conn.commit()
+
+        if not updated:
+            raise HTTPException(status_code=404, detail="Empresa não encontrada.")
+
+        return {
+            "message": f"Personalização da empresa '{updated['name']}' atualizada com sucesso!",
+            "company": {
+                "id": str(updated["id"]),
+                "name": updated["name"],
+                "primary_color": updated["primary_color"],
+                "secondary_color": updated["secondary_color"],
+                "logo_url": updated["logo_url"]
+            }
+        }
+
+# --- ENDPOINT PATCH GENÉRICO DA EMPRESA ---
+@app.patch("/v1/superadmin/companies/{company_id}")
+def update_company_generic(
+    company_id: str,
+    data: UpdateCompanyBrandingSchema,
+    current_user=Depends(require_superadmin),
+    conn=Depends(get_db)
+):
+    return update_company_branding(company_id, data, current_user, conn)
 
 @app.patch("/v1/superadmin/companies/{company_id}/status")
 def update_company_status(
