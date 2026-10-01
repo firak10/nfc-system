@@ -769,3 +769,16 @@ def change_admin_password(
         conn.commit()
 
     return {"message": "Senha alterada com sucesso!"}
+
+#---------------- rota para as cores
+@router.get("/v1/admin/me")
+def get_admin_profile(current_user: User = Depends(get_current_active_user), db: Session = Depends(get_db)):
+    company = db.query(Company).filter(Company.id == current_user.company_id).first()
+    return {
+        "id": current_user.id,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "company_name": company.name if company else "",
+        "primary_color": company.primary_color if company else "#2563eb",
+        "logo_url": company.logo_url if company else None
+    }
